@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+scpx - parallel file transfer over SSH
+
+Splits a local file into N chunks, streams them to the remote over concurrent
+SSH connections, reassembles them there, and verifies with a sha256 checksum.
+
+Usage:
+  scpx <local-file> <user@host:/remote/dir/> [streams] [stagger-secs]
+
+Arguments:
+  local-file     Path to the local file to transfer.
+  user@host:...  Remote destination directory, in scp form.
+  streams        Number of parallel SSH streams. Default: 8.
+  stagger-secs   Delay between launching each stream. Default: 0.5.
+
+Options:
+  -h, --help     Show this help and exit.
+
+Examples:
+  # 8 parallel transfer (default)
+  scpx bigfile.tar.gz root@10.23.135.2:/tmp/
+
+  # 16 parallel transfer
+  scpx bigfile.tar.gz root@10.23.135.2:/tmp/ 16
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+if [[ $# -lt 2 || $# -gt 4 ]]; then
+    usage >&2
+    exit 2
+fi
+
+file="$1"
+dest="$2"
+streams="${3:-8}"
+stagger="${4:-0.5}"
+
+if [[ ! -f "$file" ]]; then
+    echo "error: local file not found: $file" >&2
+    exit 1
+fi
+
+if [[ ! "$streams" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: streams must be a positive integer: $streams" >&2
+    exit 1
+fi
+
+if [[ ! "$stagger" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "error: stagger must be a number of seconds: $stagger" >&2
+    exit 1
+fi
+
+if [[ "$dest" != *:* ]]; then
+    echo "error: destination must be user@host:/path form: $dest" >&2
+    exit 1
+fi
+
+remote="${dest%%:*}"
+remote_path="${dest#*:}"
+remote_dir="${remote_path%/}"
+remote_dir="${remote_dir:-.}"
+base="$(basename "$file")"
+
+if [[ "$base" == *' '* ]]; then
+    echo "error: filenames with spaces are not supported: $base" >&2
+    exit 1
+fi
+
+# SSH flags. -q to silent, others for performance
+ssh_opts=(
+    -q
+    -c aes128-gcm@openssh.com
+    -o Compression=no
+)
+
+work_dir="$(mktemp -d)"
+remote_tmp=""
+# Clean local scratch always, and the remote staging dir if it is still around
+# shellcheck disable=SC2029
+trap 'rm -rf "$work_dir"; [[ -z "$remote_tmp" ]] || ssh "${ssh_opts[@]}" "$remote" "bash -c \"rm -rf ${remote_tmp}\"" || true' EXIT
+
+echo "==> splitting $base into $streams chunks"
+split -d -a 3 -n "$streams" "$file" "$work_dir/$base.part-"
+
+remote_tmp="$(mktemp -u)"
+echo "==> creating remote staging dir at $remote:$remote_tmp"
+# Client-side expansion is intended
+# shellcheck disable=SC2029
+ssh "${ssh_opts[@]}" "$remote" "bash -c \"mkdir -p ${remote_tmp}\""
+
+echo "==> transferring $streams chunks in parallel (${stagger}s stagger)"
+pids=()
+while IFS= read -r -d '' part; do
+    part_name="$(basename "$part")"
+    # Client-side expansion of remote_tmp and the chunk name is intentional; the
+    # chunk bytes are streamed to the remote cat via stdin.
+    # shellcheck disable=SC2029
+    ssh "${ssh_opts[@]}" "$remote" "bash -c \"cat > ${remote_tmp}/${part_name}\"" < "$part" &
+    pids+=("$!")
+    sleep "$stagger"
+done < <(find "$work_dir" -name "$base.part-*" -print0)
+
+transfer_rc=0
+completed=0
+total="${#pids[@]}"
+while read -r pid; do
+    if ! wait "$pid"; then
+        transfer_rc=1
+    fi
+    (( completed++ )) || true
+    printf '\r==> chunk transfer completed: %s/%s' "$completed" "$total" > /dev/tty
+done < <(printf '%s\n' "${pids[@]}")
+printf '\n' > /dev/tty
+
+if [[ "$transfer_rc" -ne 0 ]]; then
+    echo "error: one or more chunk transfers failed" >&2
+    exit 1
+fi
+
+echo "==> reassembling on remote and cleaning staging dir"
+# Client-side expansion intentional
+# shellcheck disable=SC2029
+ssh "${ssh_opts[@]}" "$remote" "bash -c \"cat ${remote_tmp}/${base}.part-* > ${remote_dir}/${base} && rm -rf ${remote_tmp}\""
+remote_tmp=""
+
+echo "==> verifying sha256 checksum"
+local_sum="$(sha256sum "$file" | awk '{print $1}')"
+# shellcheck disable=SC2029
+remote_sum="$(ssh "${ssh_opts[@]}" "$remote" "bash -c \"sha256sum ${remote_dir}/${base}\"" | awk '{print $1}')"
+
+if [[ "$local_sum" != "$remote_sum" ]]; then
+    echo "error: checksum mismatch" >&2
+    echo "  local:  $local_sum" >&2
+    echo "  remote: $remote_sum" >&2
+    exit 1
+fi
+
+echo "==> done: ${remote}:${remote_dir}/${base} verified ($local_sum)"
